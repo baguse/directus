@@ -3195,4 +3195,319 @@ describe('McpOAuthService', () => {
 			expect(result!['registration_type']).toBe('cimd');
 		});
 	});
+
+	describe('resolveClientWithFetch', () => {
+		let service: McpOAuthService;
+		const cimdClientId = 'https://tools.example.com/oauth/metadata.json';
+		const dcrClientId = crypto.randomUUID();
+
+		beforeEach(() => {
+			service = new McpOAuthService({ knex: db, schema });
+		});
+
+		it('DCR UUID lookup returns client row', async () => {
+			mockDetectClientIdType.mockReturnValue('dcr');
+
+			tracker.on.select('directus_oauth_clients').response([
+				{
+					client_id: dcrClientId,
+					client_name: 'Test DCR Client',
+					redirect_uris: JSON.stringify([TEST_REDIRECT_URI]),
+					grant_types: JSON.stringify(['authorization_code']),
+				},
+			]);
+
+			const result = await service.resolveClientWithFetch(dcrClientId);
+			expect(result['client_id']).toBe(dcrClientId);
+			expect(result['client_name']).toBe('Test DCR Client');
+		});
+
+		it('DCR UUID not found throws error', async () => {
+			mockDetectClientIdType.mockReturnValue('dcr');
+			tracker.on.select('directus_oauth_clients').response([]);
+
+			await assertOAuthError(() => service.resolveClientWithFetch(dcrClientId), {
+				error: 'invalid_request',
+			});
+		});
+
+		it('null client_id type throws error', async () => {
+			mockDetectClientIdType.mockReturnValue(null);
+
+			await assertOAuthError(() => service.resolveClientWithFetch('https://example.com/'), {
+				error: 'invalid_request',
+			});
+		});
+
+		it('CIMD fresh cache hit returns existing row (no fetch)', async () => {
+			mockDetectClientIdType.mockReturnValue('cimd');
+
+			// Settings gate
+			tracker.on.select('directus_settings').response([{ mcp_oauth_cimd_enabled: true }]);
+
+			// Existing client with future expiry
+			tracker.on.select('directus_oauth_clients').response([
+				{
+					client_id: cimdClientId,
+					client_name: 'Cached CIMD Client',
+					redirect_uris: JSON.stringify([TEST_REDIRECT_URI]),
+					metadata_expires_at: new Date(Date.now() + 3600_000),
+					metadata_fetched_at: new Date(),
+					registration_type: 'cimd',
+				},
+			]);
+
+			const result = await service.resolveClientWithFetch(cimdClientId);
+			expect(result['client_name']).toBe('Cached CIMD Client');
+			// fetchCimdMetadata should NOT have been called
+			expect(mockFetchCimdMetadata).not.toHaveBeenCalled();
+		});
+
+		it('CIMD first contact inserts new client', async () => {
+			mockDetectClientIdType.mockReturnValue('cimd');
+
+			// Settings gate
+			tracker.on.select('directus_settings').response([{ mcp_oauth_cimd_enabled: true }]);
+
+			// No existing client, then max clients cap
+			tracker.on.select('directus_oauth_clients').responseOnce([]);
+			tracker.on.select('directus_oauth_clients').responseOnce([{ count: 0 }]);
+
+			// fetchCimdMetadata returns valid metadata
+			mockFetchCimdMetadata.mockResolvedValue({
+				notModified: false,
+				metadata: {
+					client_id: cimdClientId,
+					client_name: 'New CIMD Client',
+					redirect_uris: [TEST_REDIRECT_URI],
+					grant_types: ['authorization_code'],
+					token_endpoint_auth_method: 'none',
+				},
+				etag: '"abc123"',
+				ttlMs: 3600_000,
+			});
+
+			tracker.on.insert('directus_oauth_clients').response([]);
+
+			const result = await service.resolveClientWithFetch(cimdClientId);
+			expect(result['client_id']).toBe(cimdClientId);
+			expect(result['client_name']).toBe('New CIMD Client');
+			expect(result['registration_type']).toBe('cimd');
+			expect(mockFetchCimdMetadata).toHaveBeenCalledWith(cimdClientId);
+		});
+
+		it('CIMD stale cache triggers re-fetch (200)', async () => {
+			mockDetectClientIdType.mockReturnValue('cimd');
+
+			// Settings gate
+			tracker.on.select('directus_settings').response([{ mcp_oauth_cimd_enabled: true }]);
+
+			// Existing client with past expiry (stale)
+			tracker.on.select('directus_oauth_clients').response([
+				{
+					client_id: cimdClientId,
+					client_name: 'Stale Client',
+					redirect_uris: JSON.stringify([TEST_REDIRECT_URI]),
+					metadata_expires_at: new Date(Date.now() - 1000),
+					metadata_fetched_at: new Date(Date.now() - 3600_000),
+					metadata_etag: '"old-etag"',
+					registration_type: 'cimd',
+				},
+			]);
+
+			// Re-fetch returns 200 with updated metadata
+			mockFetchCimdMetadata.mockResolvedValue({
+				notModified: false,
+				metadata: {
+					client_id: cimdClientId,
+					client_name: 'Updated Client',
+					redirect_uris: [TEST_REDIRECT_URI],
+					grant_types: ['authorization_code'],
+					token_endpoint_auth_method: 'none',
+				},
+				etag: '"new-etag"',
+				ttlMs: 3600_000,
+			});
+
+			tracker.on.update('directus_oauth_clients').response(1);
+
+			const result = await service.resolveClientWithFetch(cimdClientId);
+			expect(result['client_name']).toBe('Updated Client');
+			expect(mockFetchCimdMetadata).toHaveBeenCalledWith(cimdClientId, '"old-etag"');
+		});
+
+		it('CIMD stale cache with 304 updates timestamps only', async () => {
+			mockDetectClientIdType.mockReturnValue('cimd');
+
+			// Settings gate
+			tracker.on.select('directus_settings').response([{ mcp_oauth_cimd_enabled: true }]);
+
+			// Existing client with past expiry (stale)
+			tracker.on.select('directus_oauth_clients').response([
+				{
+					client_id: cimdClientId,
+					client_name: 'Existing Client',
+					redirect_uris: JSON.stringify([TEST_REDIRECT_URI]),
+					metadata_expires_at: new Date(Date.now() - 1000),
+					metadata_fetched_at: new Date(Date.now() - 3600_000),
+					metadata_etag: '"etag-1"',
+					registration_type: 'cimd',
+				},
+			]);
+
+			// Re-fetch returns 304
+			mockFetchCimdMetadata.mockResolvedValue({
+				notModified: true,
+				ttlMs: 7200_000,
+			});
+
+			tracker.on.update('directus_oauth_clients').response(1);
+
+			const result = await service.resolveClientWithFetch(cimdClientId);
+			// Name stays the same (304 = no content change)
+			expect(result['client_name']).toBe('Existing Client');
+			expect(mockFetchCimdMetadata).toHaveBeenCalledWith(cimdClientId, '"etag-1"');
+		});
+
+		it('CIMD disabled in env throws error', async () => {
+			mockDetectClientIdType.mockReturnValue('cimd');
+			const { useEnv } = vi.mocked(await import('@directus/env'));
+
+			useEnv.mockReturnValue({
+				PUBLIC_URL: TEST_PUBLIC_URL,
+				MCP_OAUTH_CIMD_ENABLED: false,
+			} as any);
+
+			await assertOAuthError(() => service.resolveClientWithFetch(cimdClientId), {
+				error: 'invalid_client',
+			});
+		});
+
+		it('CIMD disabled in settings throws error', async () => {
+			mockDetectClientIdType.mockReturnValue('cimd');
+
+			tracker.on.select('directus_settings').response([{ mcp_oauth_cimd_enabled: false }]);
+
+			await assertOAuthError(() => service.resolveClientWithFetch(cimdClientId), {
+				error: 'invalid_client',
+			});
+		});
+
+		it('CIMD domain not in allowlist throws error', async () => {
+			mockDetectClientIdType.mockReturnValue('cimd');
+			mockGetAllowedDomains.mockReturnValue(['allowed.com']);
+			mockIsDomainAllowed.mockReturnValue(false);
+
+			tracker.on.select('directus_settings').response([{ mcp_oauth_cimd_enabled: true }]);
+
+			await assertOAuthError(() => service.resolveClientWithFetch(cimdClientId), {
+				error: 'invalid_client',
+			});
+		});
+
+		it('CIMD max clients exceeded throws error', async () => {
+			mockDetectClientIdType.mockReturnValue('cimd');
+
+			// Settings gate
+			tracker.on.select('directus_settings').response([{ mcp_oauth_cimd_enabled: true }]);
+
+			// No existing client, then max clients reached
+			tracker.on.select('directus_oauth_clients').responseOnce([]);
+			tracker.on.select('directus_oauth_clients').responseOnce([{ count: 10000 }]);
+
+			await assertOAuthError(() => service.resolveClientWithFetch(cimdClientId), {
+				error: 'invalid_client',
+			});
+		});
+
+		it('CIMD concurrent insert falls back to SELECT', async () => {
+			mockDetectClientIdType.mockReturnValue('cimd');
+
+			// Settings gate
+			tracker.on.select('directus_settings').response([{ mcp_oauth_cimd_enabled: true }]);
+
+			// No existing client, then max clients cap, then fallback SELECT after concurrent insert
+			tracker.on.select('directus_oauth_clients').responseOnce([]);
+			tracker.on.select('directus_oauth_clients').responseOnce([{ count: 0 }]);
+
+			mockFetchCimdMetadata.mockResolvedValue({
+				notModified: false,
+				metadata: {
+					client_id: cimdClientId,
+					client_name: 'CIMD Client',
+					redirect_uris: [TEST_REDIRECT_URI],
+					grant_types: ['authorization_code'],
+					token_endpoint_auth_method: 'none',
+				},
+				etag: '"abc"',
+				ttlMs: 3600_000,
+			});
+
+			// INSERT throws unique constraint violation
+			const dbError = new Error('duplicate key value violates unique constraint');
+			tracker.on.insert('directus_oauth_clients').simulateError(dbError);
+
+			// translateDatabaseError returns RecordNotUniqueError
+			mockTranslateDatabaseError.mockResolvedValue(
+				new RecordNotUniqueError({ collection: 'directus_oauth_clients', field: 'client_id' }),
+			);
+
+			// Fallback SELECT after concurrent insert
+			tracker.on.select('directus_oauth_clients').response([
+				{
+					client_id: cimdClientId,
+					client_name: 'CIMD Client',
+					registration_type: 'cimd',
+				},
+			]);
+
+			const result = await service.resolveClientWithFetch(cimdClientId);
+			expect(result['client_id']).toBe(cimdClientId);
+		});
+	});
+
+	describe('resolveClientFromDb', () => {
+		let service: McpOAuthService;
+
+		beforeEach(() => {
+			service = new McpOAuthService({ knex: db, schema });
+		});
+
+		it('returns client row when found', async () => {
+			const clientId = crypto.randomUUID();
+
+			tracker.on
+				.select('directus_oauth_clients')
+				.response([{ client_id: clientId, client_name: 'Test', registration_type: 'dcr' }]);
+
+			const result = await service.resolveClientFromDb(clientId);
+			expect(result).toBeDefined();
+			expect(result!['client_id']).toBe(clientId);
+		});
+
+		it('returns undefined when not found', async () => {
+			tracker.on.select('directus_oauth_clients').response([]);
+
+			const result = await service.resolveClientFromDb('nonexistent');
+			expect(result).toBeUndefined();
+		});
+
+		it('does NOT gate on CIMD enabled (drain-naturally)', async () => {
+			const cimdClientId = 'https://tools.example.com/metadata';
+
+			tracker.on.select('directus_oauth_clients').response([{ client_id: cimdClientId, registration_type: 'cimd' }]);
+
+			// Even with CIMD disabled, resolveClientFromDb should still work
+			const { useEnv } = vi.mocked(await import('@directus/env'));
+
+			useEnv.mockReturnValue({
+				PUBLIC_URL: TEST_PUBLIC_URL,
+				MCP_OAUTH_CIMD_ENABLED: false,
+			} as any);
+
+			const result = await service.resolveClientFromDb(cimdClientId);
+			expect(result).toBeDefined();
+			expect(result!['registration_type']).toBe('cimd');
+		});
+	});
 });
