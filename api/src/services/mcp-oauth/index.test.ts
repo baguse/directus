@@ -5,7 +5,7 @@ import jwt from 'jsonwebtoken';
 import knex, { type Knex } from 'knex';
 import { createTracker, MockClient, type Tracker } from 'knex-mock-client';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, type MockedFunction, vi } from 'vitest';
-import { McpOAuthService, OAuthError } from './index.js';
+import { isDomainAllowed, McpOAuthService, OAuthError } from './index.js';
 
 vi.mock('../../database/index.js', () => ({
 	default: vi.fn(),
