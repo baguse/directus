@@ -1493,12 +1493,12 @@ describe('McpOAuthService', () => {
 			expect(result.access_token).toBeDefined();
 		});
 
-			it('code already used returns invalid_grant without revoking public-client grant', async () => {
-				mockCodeLookup();
-				// Atomic update returns 0 = already used
-				tracker.on.update('directus_oauth_codes').response(0);
+		it('code already used returns invalid_grant without revoking public-client grant', async () => {
+			mockCodeLookup();
+			// Atomic update returns 0 = already used
+			tracker.on.update('directus_oauth_codes').response(0);
 
-				await assertOAuthError(() => service.exchangeCode(validParams(), context), { error: 'invalid_grant' });
+			await assertOAuthError(() => service.exchangeCode(validParams(), context), { error: 'invalid_grant' });
 
 			expect(queryHistory('select', 'directus_oauth_tokens')).toHaveLength(0);
 			expect(queryHistory('delete', 'directus_oauth_tokens')).toHaveLength(0);
@@ -2550,6 +2550,5 @@ describe('McpOAuthService', () => {
 			expect(clientSelects[0]!.sql).toContain('directus_sessions');
 			expect(clientSelects[0]!.sql).toContain('directus_oauth_tokens');
 		});
-
 	});
 });
