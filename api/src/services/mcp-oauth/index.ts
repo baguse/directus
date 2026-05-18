@@ -773,6 +773,11 @@ export class McpOAuthService {
 
 		this.authenticateClient(preAuthClient, params, basicAuth);
 
+		const tokenEndpointAuthMethod = preAuthClient['token_endpoint_auth_method'];
+
+		const isAuthenticatedConfidentialClient =
+			tokenEndpointAuthMethod === 'client_secret_basic' || tokenEndpointAuthMethod === 'client_secret_post';
+
 		// 1. RFC 6749 Section 4.1.3: required token request params
 		if (!params.grant_type) {
 			throw new OAuthError(400, 'invalid_request', 'grant_type is required');
@@ -830,6 +835,11 @@ export class McpOAuthService {
 
 			if (burned === 0) {
 				logger.warn({ code_hash: codeHash }, 'Authorization code already used');
+
+				if (isAuthenticatedConfidentialClient) {
+					await this.revokeGrantByCodeHash(trx, codeHash, resolvedClientId);
+				}
+
 				return { replayed: true as const };
 			}
 
@@ -1867,6 +1877,16 @@ export class McpOAuthService {
 			await db('directus_sessions').where('token', reuseGrant['session']).delete();
 
 			logger.warn({ client_id: clientId, grant_id: reuseGrant['id'] }, 'Refresh token reuse detected, grant revoked');
+		}
+	}
+
+	/** Detect and revoke a grant issued from a replayed authorization code. */
+	private async revokeGrantByCodeHash(db: Knex | Knex.Transaction, codeHash: string, clientId: string): Promise<void> {
+		const replayGrant = await db('directus_oauth_tokens').where({ code_hash: codeHash, client: clientId }).first();
+
+		if (replayGrant) {
+			await db('directus_oauth_tokens').where('id', replayGrant['id']).delete();
+			await db('directus_sessions').where('token', replayGrant['session']).delete();
 		}
 	}
 
