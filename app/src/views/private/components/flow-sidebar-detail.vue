@@ -1,14 +1,29 @@
 <script setup lang="ts">
+import { useBreakpoints } from '@vueuse/core';
+import { useSidebarStore } from '../private-view/stores/sidebar.js';
 import SidebarDetail from './sidebar-detail.vue';
 import VButton from '@/components/v-button.vue';
 import VIcon from '@/components/v-icon/v-icon.vue';
 import { type ManualFlow, useInjectRunManualFlow } from '@/composables/use-flows';
+import { BREAKPOINTS } from '@/constants';
 
 defineProps<{
 	manualFlows: ManualFlow[];
 }>();
 
+const sidebarStore = useSidebarStore();
 const { runManualFlow, runningFlows } = useInjectRunManualFlow();
+const breakpoints = useBreakpoints(BREAKPOINTS);
+
+const run = (flowId: string) => {
+	const isMobile = breakpoints.smallerOrEqual('sm');
+
+	if (isMobile.value) {
+		sidebarStore.collapse();
+	}
+
+	runManualFlow(flowId);
+};
 </script>
 
 <template>
@@ -22,7 +37,7 @@ const { runManualFlow, runningFlows } = useInjectRunManualFlow();
 					:style="{ '--v-button-background-color': manualFlow.color }"
 					:loading="runningFlows.includes(manualFlow.id)"
 					:disabled="manualFlow.isFlowDisabled"
-					@click="runManualFlow(manualFlow.id)"
+					@click="run(manualFlow.id)"
 				>
 					<VIcon :name="manualFlow.icon ?? 'bolt'" small left />
 					{{ manualFlow.name }}
